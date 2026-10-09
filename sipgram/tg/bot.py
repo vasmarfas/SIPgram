@@ -155,7 +155,7 @@ class BotUi:
             log.info("bot could not send the recording to %s: %s", uid, e)
             return False
 
-    async def card(self, uid: int, text: str, buttons: Buttons | None, keypad_ok: bool) -> None:
+    async def card(self, uid: int, text: str, buttons: Buttons | None, keypad_ok: bool) -> bool:
         rows: Buttons = [list(r) for r in (buttons or [])]
         if keypad_ok:
             lang = self.lang_of(uid)
@@ -170,37 +170,45 @@ class BotUi:
         if msg_id:
             try:
                 await self.client.edit_message(uid, msg_id, text, buttons=markup)
-                return
+                return True
             except MessageNotModifiedError:
-                return
+                return True
             except RPCError as e:
                 log.debug("card edit failed (%s), sending a new one", e)
                 self._cards.pop(uid, None)
         try:
             msg = await self.client.send_message(uid, text, buttons=markup)
             self._cards[uid] = msg.id
+            return True
         except RPCError as e:
             log.info("bot cannot send card to %s: %s", uid, e)
             self._ready.discard(uid)
+            return False
 
     async def refresh_card(self, uid: int) -> None:
         if self.card_provider is None:
             return
         spec = self.card_provider(uid)
         if spec is None:
-            await self.clear_card(uid)
+            await self.close_card(uid, t("call_ended_short", self.lang_of(uid)))
             return
         text, buttons, keypad_ok = spec
         await self.card(uid, text, buttons, keypad_ok)
 
-    async def clear_card(self, uid: int) -> None:
+    async def close_card(self, uid: int, text: str, buttons: Buttons | None = None) -> bool:
+        """Rewrites the card with the outcome of the call, so the chat keeps one message per call."""
         msg_id = self._cards.pop(uid, None)
         self._keypad.discard(uid)
-        if msg_id:
-            try:
-                await self.client.edit_message(uid, msg_id, buttons=None)
-            except Exception:
-                pass
+        if not msg_id:
+            return False
+        try:
+            await self.client.edit_message(uid, msg_id, text, buttons=self._markup(buttons))
+            return True
+        except MessageNotModifiedError:
+            return True
+        except Exception as e:
+            log.debug("closing the card failed: %s", e)
+            return False
 
 
 async def bot_login_check(app: TelegramAppConfig) -> str:

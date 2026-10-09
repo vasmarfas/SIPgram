@@ -19,8 +19,11 @@ One gateway account serves every user at the same time.
 * Opus at 48 kHz on the SIP side, so wideband audio survives all the way from Telegram to the extension.
 * Conference through the PBX, HTTP API for CRM systems, admin alerts, several gateway accounts.
 * Incoming call screening: work hours, quiet hours, blacklist, whitelist, forwarding of filtered calls back to the PBX.
-* Telegram group call: the conversation moves into a group voice chat where people without an extension can join.
-* Optional bot with buttons: DTMF keypad, hold and switch, transfer, call back, a live call card.
+* Telegram group call: the other party adds people right in the call, or `/group` moves the conversation into a
+  group voice chat or a Telegram conference call that needs no group. The PBX party stays in the conversation.
+* Optional bot with buttons: DTMF keypad, hold and switch, transfer, call back. A call takes one card message in the
+  chat: incoming, in progress, outcome.
+* Any Telegram client can answer, Telegram Web included.
 * Runs on Linux (Docker or native) and on Windows, with no compilation: `pip install` is enough.
 
 ```
@@ -126,7 +129,8 @@ Use `sipgram -c path/to/config.yaml <command>` when the config is not in the cur
 ## Telegram side
 
 * Every user adds the gateway account to their contacts, or allows calls from everyone (Settings, Privacy and
-  Security, Calls). Otherwise Telegram rejects the call with `USER_PRIVACY_RESTRICTED`, which the PBX sees as 403.
+  Security, Calls). Otherwise Telegram rejects the call with `USER_PRIVACY_RESTRICTED`: the PBX gets 480 and the user
+  gets a message in the chat saying what to change.
 * The gateway adds the users to its own contacts so that it can accept their calls.
 * Give the gateway account a recognisable name and avatar, for example "Office". Telegram calls will show up as
   coming from it.
@@ -257,9 +261,9 @@ extension: Connectivity, Trunks, Add Trunk, chan_pjsip.
 * Advanced: From User `tg-trunk`, codecs ulaw and alaw.
 * An Outbound Route with a dial pattern like `tg#.` or `+X.` pointing at the `sipgram` trunk.
 
-Users without an extension of their own dial out through the shared account. The gateway only accepts INVITEs from
-the `sip.server` address but does not authenticate them, so do not expose its SIP ports to the internet without a
-firewall.
+Users without an extension of their own dial out through the shared account. The gateway takes new calls and SIP
+MESSAGEs only from the `sip.server` address and the networks in `sip.allow_from`, and drops the rest with a warning
+in the log. It still does not authenticate them, so do not expose its SIP ports to the internet without a firewall.
 
 ### Plain Asterisk without FreePBX
 
@@ -326,7 +330,7 @@ sip:
 | `telegram.gateways` | additional gateway accounts; `users[].gateway` pins a user to one of them |
 | `telegram.language`, `users[].language` | starting interface language (`ru` or `en`); each user switches it with `/lang` and the choice is remembered |
 | `users[]` | id, @username or +phone, plus `name` and `can_call: false` for receive-only users |
-| `sip.*` | defaults for every account: server, port, transport (`udp`/`tcp`/`tls`), codecs, RTP ports, `public_ip` |
+| `sip.*` | defaults for every account: server, port, transport (`udp`/`tcp`/`tls`), codecs, RTP ports, `public_ip`, `allow_from` (addresses and networks besides `sip.server` that may place calls) |
 | `sip.accounts[].user` / `users` | owners of the extension; the first one takes incoming calls, `ring_all: true` rings everybody and the first to answer wins |
 | `sip.accounts[].shared` | shared trunk account: the PBX dials `tg#username`, `+7999...` or an id through it, and users without their own extension dial out through it |
 | `sip.accounts[].ring_timeout` | how long Telegram rings before the PBX gets 480 and follows its own logic |
@@ -338,7 +342,7 @@ sip:
 | `calls.ringback` | ringback tone while the PBX dials: `ru`, `us`, `none` |
 | `calls.record` | `off`, `ask` (turned on with `/rec`) or `all`; the recording is sent as a voice message and not stored |
 | `calls.conference_extension` | ConfBridge room on the PBX, enables `/conf` |
-| `calls.group_chat` | Telegram group whose voice chat `/group` uses |
+| `calls.group_chat` | Telegram group whose voice chat `/group` uses; empty means a Telegram conference call with no group |
 | `schedule.*` | work and quiet hours, blacklist and whitelist, what happens to a filtered call; empty by default, so nothing is filtered |
 | `users[].schedule` | the same for one user; missing keys fall back to the global section |
 | `notifications.admin` | who gets told about lost registrations, Telegram problems, start and stop |
@@ -354,9 +358,9 @@ buttons.
 
 | Action | How |
 |---|---|
-| Incoming call from the PBX | A message with the caller name and number, then a Telegram call. No answer within `ring_timeout` gives the PBX 480, so voicemail and follow-me work; declining gives 603. |
+| Incoming call from the PBX | A message with the caller name and number, then a Telegram call. No answer within `ring_timeout` gives the PBX 480, so voicemail and follow-me work; declining gives 603. With the bot this is one card: incoming, in progress, and the outcome with a "Call back" button. |
 | Call out | Send a number (`+7 999 123-45-67`, `8903...`, `101`, `sip:user@host`). The gateway calls you back and dials. While the PBX is dialling you hear a ringback or the early media of the PBX. With several extensions, `/line` shows and picks the line and `491: 101` dials through a specific one. |
-| Call the gateway | Connects you to the `default_destination` of your line, or to the last number you sent within `pending_number_ttl`. |
+| Call the gateway | Connects you to the `default_destination` of your line, or to the last number you sent within `pending_number_ttl`. Inviting the gateway into a Telegram group call works the same way: it joins and brings the number in. |
 | DTMF | During a call send digits, `*` or `#` (`1`, `123#`) or use `/dtmf 123`; the bot has a keypad. You hear the tone yourself and the gateway echoes the digits back as a message. By default the digits go out of band (RFC 4733), so a human on the other end does not hear them; set `dtmf: inband` if they should. Codes like `*1...` are intercepted by the PBX itself, see [Diagnostics](#diagnostics). |
 | Feature codes | Outside a call send the code (`*97`, `*43`) and the gateway dials it as an ordinary number, with no in-call interception. |
 | Second incoming call | You get a "second incoming call" message: `/switch` accepts it and puts the current one on hold with MOH from the PBX, `/decline` rejects it. `/switch` then toggles between the two, `/hangup` ends the current one and brings back the held one. |
@@ -364,6 +368,8 @@ buttons.
 | Transfer | `/transfer` with two calls connects them to each other and drops you (attended). `/transfer 102` transfers the other party to 102 through REFER (blind). |
 | Hang up | Hang up in Telegram to end everything, or `/hangup` for the current call only. |
 | Connection lost | If the Telegram call drops on its own, the other party goes on hold and the gateway calls you back for up to `reconnect_timeout` seconds. |
+| Add people | Tap "Add participant" in the Telegram call. The call becomes a group call, the gateway moves into it together with the PBX party and the card shows the number of participants. When nobody but the gateway is left, the PBX leg is hung up. |
+| Encryption key | The call card shows four emoji. If they match the emoji on the Telegram call screen, you and the gateway share the key and nobody sits in the middle. |
 | `/cb`, `/redial` | Call the last caller back, repeat the last number dialled. |
 | `/dnd` | Do not disturb: incoming PBX calls get busy. |
 | Schedule | `/schedule` shows your work and quiet hours, the number lists and whether you are taking calls right now. It is configured in `schedule` and empty by default. |
@@ -371,7 +377,7 @@ buttons.
 | Language | `/lang en` or `/lang ru` switches the interface for you only, and the choice survives restarts. |
 | Recording | `/rec` toggles recording of the current conversation. When it stops, or the call ends, the recording arrives as a voice message. Nothing is written to disk. With `calls.record: all` every conversation is recorded. |
 | Conference | `/conf` moves the active and held calls into the ConfBridge room on the PBX and joins you to it. `/conf 101` also dials 101 into the same room. |
-| Group call | `/group` moves the conversation into the voice chat of `calls.group_chat`: the PBX legs stay on the gateway and the Telegram call is replaced by an invitation to the voice chat, which any member of the group can join. `/group @petya` also invites a person, `/group 101` brings in an extension, `/group stop` ends everything and `/hangup` ends only your lines. |
+| Group call | `/group` moves the conversation into a Telegram group call: the voice chat of `calls.group_chat`, or a new Telegram conference call when no group is set. The PBX legs stay on the gateway and the Telegram call is replaced by an invitation. `/group @petya` also invites a person, `/group 101` brings in an extension, `/group stop` ends everything and `/hangup` ends only your lines. |
 
 FreePBX feature codes (`##` for transfer, `*2` for parking) work through DTMF as well when they are enabled for the
 extension.
@@ -499,8 +505,11 @@ Check `asterisk -rx "pjsip show contacts"`. A private address there means Rewrit
 **The call drops after about 30 seconds.** The ACK is not getting through (`no ACK for final response` in the log),
 which is normally a NAT problem with the address in Contact or Via.
 
-**`USER_PRIVACY_RESTRICTED`, 403 for the PBX.** The user has calls restricted: they should add the gateway account
-to their contacts or allow calls from everyone.
+**`USER_PRIVACY_RESTRICTED`, 480 for the PBX.** The user has calls restricted, and the gateway tells them so in the
+chat. They should add the gateway account to their contacts or to the call exceptions.
+
+**`INVITE from ... ignored` in the log.** The PBX sends calls from an address other than the one `sip.server`
+resolves to (several interfaces, a cluster). Add that address or network to `sip.allow_from`.
 
 **`cannot resolve user 123456789`.** The gateway has not seen this user yet. Send it any message from that account,
 or list the user as `@username` or `+phone`.
@@ -514,7 +523,7 @@ relays. Check outgoing UDP from the host and any DPI or blocking of Telegram cal
 **The call connects but there is silence.** The log ends with `bridge stopped: sip->tg N frames, tg->sip M frames`.
 `tg->sip 0` means NTgCalls is not producing frames; `sip->tg 0` means there is no RTP from the PBX.
 
-**Delay or crackling.** Raise `audio.jitter_ms` to 60 or 100 on a poor network between the gateway and the PBX, or
+**Delay or crackling.** Raise `calls.jitter_ms` to 60 or 100 on a poor network between the gateway and the PBX, or
 lower it to 20 for a local PBX.
 
 **"Access denied" in response to `*1...`.** This is FreePBX, not the gateway: `*1` during a call is reserved for
@@ -554,9 +563,12 @@ docker compose up --build --abort-on-container-exit --exit-code-from tester
 docker compose down
 ```
 
-102 unit tests, about 10 seconds: the SIP parser, digest against the RFC 2617 vector, SDP offer and answer, G.711
-and Opus, RTP, the Ogg container, the config, the call logic on fake legs, the schedule and number lists, voice
-chats, localisation, the HTTP API and the state file housekeeping.
+125 unit tests, about 15 seconds: the SIP parser, digest against the RFC 2617 vector, SDP offer and answer, G.711
+and Opus, RTP, the Ogg container, the config, the call logic on fake legs, the schedule and number lists, the
+Telegram call engine with conferences on a fake NTgCalls, localisation, the HTTP API and the state file
+housekeeping. Two of them run the real ntgcalls: two instances call each other inside the process over protocols 9
+and 13, checking the key exchange, the emoji, audio both ways and the order of frames. They are skipped on Windows,
+where ntgcalls keeps the process from exiting.
 
 24 end-to-end tests against `andrius/asterisk` (Asterisk 22.10) with the configs from `tests/integration/asterisk/`:
 registration over UDP and TCP, wrong password, outgoing call to `Echo()` with a spectral check of the returned
@@ -581,7 +593,7 @@ sipgram/
   schedule.py      schedule windows, number patterns, the screening decision
   doctor.py        the doctor command
   sip/             own SIP stack: message parser, digest, SDP, codecs, libopus binding, RTP, RTCP, transports, account
-  tg/              Telethon account, NTgCalls engine, group calls, optional bot, notification routing
+  tg/              Telethon account, NTgCalls engine, group calls and conferences, optional bot, notifications
   audio/           PCM buffer, resampler, Ogg/Opus container, in-memory recorder, tone generator
 ```
 
@@ -599,24 +611,35 @@ The Telegram side drives NTgCalls directly, with Telethon for MTProto, instead o
 sequence is the same, plus `phone.receivedCall`, precise ring timeouts and explicit `discardCall` reasons, so the
 PBX gets meaningful codes (486, 480, 603) and voicemail and follow-me behave correctly.
 
+When the other party adds people, Telegram discards the private call with
+`phoneCallDiscardReasonMigrateConferenceCall`. The gateway joins the conference by the slug in that reason, taking
+the media of the private call along, and from then on keeps the conference's E2E chain itself: it applies blocks,
+answers subchain requests and tells NTgCalls which SSRC belongs to whom. A `messageActionConferenceCall` invitation
+from a user is handled as an incoming call.
+
+NTgCalls 3 runs its calls on a thread pool, and two 10 ms frames handed over back to back could overtake each
+other: on Windows that happened to 3 to 4% of frames. Frames therefore go through `FrameSender` strictly one at a
+time.
+
 Audio needs no resampling in the common case. The external frame rate of NTgCalls is set to the SIP codec rate, and
 WebRTC inside NTgCalls resamples to Opus 48 kHz. Telegram to SIP is packetised by a 20 ms ticker with a `jitter_ms`
 buffer; SIP to Telegram is handed over in 10 ms frames as the RTP arrives, and the jitter is absorbed by NetEq on
 the client.
 
-Call recording is encoded to Opus as it goes (about 4 KB/s) and kept in an Ogg container in memory, so a ten minute
-conversation costs a couple of megabytes. When the bridge stops, the file is sent to the chat and dropped.
+Call recording is encoded to Opus as it goes (20 kbit/s, about 2.5 KB/s) and kept in an Ogg container in memory, so
+a ten minute conversation costs about one and a half megabytes. When the bridge stops, the file is sent to the chat and dropped.
 
 ## Limitations
 
 * One conversation per user, plus a held and a waiting call. Parallelism happens between users.
 * How many simultaneous calls one Telegram account really sustains is up to Telegram. Keep `max_calls` small on the
   first runs.
-* Telegram Web (web.telegram.org/k) uses call protocol 12/13, which is not in the stable NTgCalls 2.2.x. Mobile and
-  desktop clients work.
 * Voice only. SIP codecs: Opus, G.711, L16. TLS signalling is supported, SRTP is not.
-* A group call uses the voice chat of an existing Telegram group, so the gateway account has to be a member with
-  the right to start one. While the conversation is in a voice chat, DTMF cannot be sent from the chat for that leg.
+* A group voice chat needs the gateway account to be a member with the right to start one; without
+  `calls.group_chat`, `/group` starts a Telegram conference call instead. While the conversation is in a group
+  call, DTMF cannot be sent from the chat for that leg.
+* Telegram conference calls are verified on a fake NTgCalls and against the protocol; there has been no live run
+  with several participants yet.
 * On Windows the process exits through `TerminateProcess`, a limitation of the ntgcalls library.
 
 ## License

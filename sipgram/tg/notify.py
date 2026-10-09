@@ -46,11 +46,15 @@ class Notifier:
                 return True
         return await self.account_of(uid).send_voice(uid, ogg, duration, caption)
 
-    async def card(self, uid: int, text: str, buttons: Buttons | None, keypad_ok: bool) -> None:
+    async def card(self, uid: int, text: str, buttons: Buttons | None, keypad_ok: bool) -> bool:
+        """Shows the live call card. Returns False when the user has no bot to show it in."""
         if self.via_bot(uid):
             assert self.bot is not None
-            await self.bot.card(uid, text, buttons, keypad_ok)
+            return await self.bot.card(uid, text, buttons, keypad_ok)
+        return False
 
-    async def clear_card(self, uid: int) -> None:
+    async def close_card(self, uid: int, text: str, buttons: Buttons | None = None) -> bool:
+        """Turns the live card into the last word about the call. False when there was no card."""
         if self.bot is not None:
-            await self.bot.clear_card(uid)
+            return await self.bot.close_card(uid, text, buttons)
+        return False

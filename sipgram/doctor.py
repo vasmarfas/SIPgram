@@ -76,8 +76,12 @@ def _check_runtime(rep: Report, cfg: Config) -> None:
         import ntgcalls
 
         protocol = ntgcalls.NTgCalls.get_protocol()
-        rep.add(OK, "ntgcalls", f"layers {protocol.min_layer}-{protocol.max_layer}, "
-                                f"libraries {', '.join(protocol.library_versions)}")
+        version = getattr(ntgcalls, "__version__", "?")
+        if not version[:1].isdigit() or int(version.split(".")[0]) < 3:
+            rep.add(FAIL, "ntgcalls", f"{version} is too old, sipgram needs 3.x: pip install -U -r requirements.txt")
+        else:
+            rep.add(OK, "ntgcalls", f"{version}, layers {protocol.min_layer}-{protocol.max_layer}, "
+                                    f"libraries {', '.join(protocol.library_versions)}")
     except Exception as e:
         rep.add(FAIL, "ntgcalls", f"not usable: {e}")
     from .sip.opus import available, load_error

@@ -6,6 +6,7 @@ The v0.1 ``lines`` layout is migrated automatically when all lines use the same 
 """
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 from dataclasses import dataclass, field, fields
@@ -174,6 +175,7 @@ class SipConfig:
     keepalive: int = 25
     tls_verify: bool = True
     user_agent: str = f"SIPgram/{__version__}"
+    allow_from: list[str] = field(default_factory=list)   # besides sip.server, who may start calls and send messages
 
     def __post_init__(self) -> None:
         if not self.server:
@@ -191,6 +193,12 @@ class SipConfig:
             raise ConfigError("sip.dtmf must be rfc2833, inband, info or none")
         if self.rtp_port_min > self.rtp_port_max:
             raise ConfigError("sip.rtp_port_min must be <= sip.rtp_port_max")
+        self.allow_from = [str(a) for a in self.allow_from or []]
+        for item in self.allow_from:
+            try:
+                ipaddress.ip_network(item, strict=False)
+            except ValueError as e:
+                raise ConfigError(f"sip.allow_from: {item} is not an IP address or network") from e
         from .sip.codecs import codec_list
 
         try:

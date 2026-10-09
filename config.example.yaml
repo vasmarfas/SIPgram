@@ -39,6 +39,8 @@ sip:                            # defaults for every account below (each key may
   rtp_port_max: 40200
   # local_ip: ""                # bind address, auto-detected
   # public_ip: ""               # address to advertise when the PBX cannot reach the bind address
+  # allow_from: []              # calls and SIP MESSAGEs are taken only from sip.server; add other PBX addresses or
+                                # networks here, e.g. ["10.0.0.0/24"], when it sends from more than one
   # dtmf: rfc2833               # rfc2833: out of band, like a normal phone (the default)
                                 # inband: the tone is mixed into the audio, the other party hears it
                                 # info: SIP INFO; none: send nothing
@@ -75,7 +77,8 @@ calls:
                                 # ask: /rec turns it on for the current call; all: every call is recorded
   record_max_minutes: 60        # stop recording after this long (bounds memory use)
   conference_extension: ""      # ConfBridge room on the PBX, e.g. "8000", enables /conf
-  group_chat: ""                # Telegram group whose voice chat /group uses, e.g. "@myteam" or -1001234567890
+  group_chat: ""                # Telegram group whose voice chat /group uses, e.g. "@myteam" or -1001234567890;
+                                # empty: /group starts a Telegram conference call that needs no group
                                 # the gateway account must be a member with the right to start a voice chat
   group_title: SIPgram          # title of the voice chat when the gateway starts one
   jitter_ms: 40                 # Telegram -> RTP smoothing buffer

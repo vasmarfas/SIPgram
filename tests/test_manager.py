@@ -163,6 +163,11 @@ class FakeTgCall:
         self.hangups: list[str] = []
         self.accepted = False
         self.sent = bytearray()
+        self.conference = None
+        self.invite_msg_id = None
+        self.emojis = ""
+        self.others = 1
+        self.on_update = None
 
     @property
     def active(self):
@@ -192,8 +197,9 @@ class FakeTgCall:
 
 
 class FakeGroupCall:
-    def __init__(self, loop, title):
+    def __init__(self, loop, title, conference=False):
         self.title = title
+        self.conference = conference
         self.sample_rate = 48000
         self.ended = loop.create_future()
         self.on_audio = None
@@ -239,6 +245,8 @@ class FakeEngine:
         mode = self.behaviour.get(uid, "answer")
         if mode == "busy":
             raise TgCallError("busy", 486)
+        if mode == "privacy":
+            raise TgCallError("user's privacy settings do not allow calls from the gateway account", 403)
         call = FakeTgCall(self.loop, uid, True, sample_rate or 8000)
         self.calls[uid] = call
         if mode == "wait":
@@ -256,6 +264,10 @@ class FakeEngine:
         group = self.groups.get(chat)
         if group is None or not group.active:
             group = self.groups[chat] = FakeGroupCall(self.loop, title or chat)
+        return group
+
+    async def create_conference(self, title=""):
+        group = self.groups["conference"] = FakeGroupCall(self.loop, title or "Telegram", conference=True)
         return group
 
     async def cancel(self, uid, reason="missed"):
@@ -304,16 +316,38 @@ class FakeNotifier:
 
     async def card(self, uid, text, buttons, keypad_ok):
         self.cards.append((uid, text))
+        return False
 
     async def send_voice(self, uid, ogg, duration, caption=""):
         self.voices.append((uid, ogg, duration, caption))
         return True
 
-    async def clear_card(self, uid):
+    async def close_card(self, uid, text, buttons=None):
         self.cleared.append(uid)
+        return False
 
     def texts(self, uid=None):
         return [t for u, t, _ in self.sent if uid is None or u == uid]
+
+
+class BotNotifier(FakeNotifier):
+    """Users who started the bot: the call card is one message edited in place."""
+
+    def __init__(self):
+        super().__init__()
+        self.card_text: dict[int, str] = {}
+        self.closed: dict[int, list[tuple[str, object]]] = {}
+
+    async def card(self, uid, text, buttons, keypad_ok):
+        self.cards.append((uid, text))
+        self.card_text[uid] = text
+        return True
+
+    async def close_card(self, uid, text, buttons=None):
+        if self.card_text.pop(uid, None) is None:
+            return False
+        self.closed.setdefault(uid, []).append((text, buttons))
+        return True
 
 
 def make_manager(loop, *, ring_all=False, shared=False, max_calls=10, call_waiting=True, mode="callback",
@@ -535,7 +569,7 @@ async def test_outgoing_busy_plays_tone_and_reports():
     tg = m.users[John].tg
     sip.terminate(486, "Busy Here")
     await asyncio.sleep(2.3)
-    assert any("486" in t for t in m.notifier.texts(John))
+    assert any("занято (486)" in t for t in m.notifier.texts(John)), "the SIP code comes with its meaning"
     assert tg.hangups == ["hangup"] and m.users[John].tg is None
     assert m.history.last(John)[0].result == "busy"
 
@@ -930,6 +964,9 @@ async def test_schedule_command_describes_the_rules():
     await m.handle_text(John, "/schedule")
     text = m.notifier.texts(John)[-1]
     assert "mon,tue,wed,thu,fri 09:00-18:00" in text and "7495*" in text and "*97" in text
+    u.rules = ScheduleConfig(quiet_hours=["all 23:00-07:00"], action="busy")
+    await m.handle_text(John, "/schedule")
+    assert "«занято» (486)" in m.notifier.texts(John)[-1]
 
 
 # ---- Telegram voice chats -----------------------------------------------------------------------
@@ -987,11 +1024,22 @@ async def test_hangup_ends_your_own_lines_in_the_voice_chat():
 
 
 @pytest.mark.asyncio
-async def test_group_call_without_a_chat_configured_explains_itself():
+async def test_group_call_without_a_chat_starts_a_conference_call():
+    """No group configured: /group starts a Telegram conference call instead of a group's voice chat."""
     loop = asyncio.get_running_loop()
     m = make_manager(loop)
-    await m.handle_text(John, "/group")
-    assert "calls.group_chat" in m.notifier.texts(John)[-1] and not m.group_calls
+    call = FakeSipCall(loop, incoming=True)
+    await m._sip_incoming(m.accounts[0], call)
+    await settle()
+    await m.handle_text(John, "/group @petya")
+    await settle()
+    session = m.group_calls["main"]
+    assert session.call.conference and session.legs[0].call is call
+    assert session.call.invited == [John, PETYA]
+    texts = m.notifier.texts(John)
+    assert any("групповом звонке Telegram" in t for t in texts) and not any("голосовом чате" in t for t in texts)
+    await m.handle_text(John, "/status")
+    assert "Групповой звонок Telegram: линий 1" in m.notifier.texts(John)[-1]
 
 
 @pytest.mark.asyncio
@@ -1026,3 +1074,112 @@ def tone(level: int, rate: int) -> bytes:
 
 def samples(buf: bytes):
     return np.frombuffer(bytes(buf), dtype="<i2")
+
+
+# ---- the call card and what the user is told ---------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bot_keeps_one_message_per_call():
+    """With the bot the incoming notice is the live card, and the outcome replaces it when the call ends."""
+    loop = asyncio.get_running_loop()
+    m = make_manager(loop)
+    m.notifier = BotNotifier()
+    m.engine.behaviour[John] = "wait"
+    call = FakeSipCall(loop, incoming=True)
+    task = asyncio.ensure_future(m._sip_incoming(m.accounts[0], call))
+    await settle()
+    assert "Входящий" in m.notifier.card_text[John] and not m.notifier.texts(John)
+    m.engine.release(John)
+    await asyncio.wait_for(task, 2)
+    await settle()
+    assert "Разговор с" in m.notifier.card_text[John]
+    call.terminate()
+    await settle()
+    text, buttons = m.notifier.closed[John][-1]
+    assert "завершён" in text and buttons == [[("📲 Перезвонить", "/cb")]]
+    assert not m.notifier.texts(John), "no separate message for the end of the call"
+
+
+@pytest.mark.asyncio
+async def test_missed_call_turns_the_card_into_a_missed_notice():
+    loop = asyncio.get_running_loop()
+    m = make_manager(loop)
+    m.notifier = BotNotifier()
+    m.engine.behaviour[John] = "wait"
+    call = FakeSipCall(loop, incoming=True)
+    task = asyncio.ensure_future(m._sip_incoming(m.accounts[0], call))
+    await settle()
+    call.terminate(487, "cancelled by caller")
+    await asyncio.wait_for(task, 2)
+    text, buttons = m.notifier.closed[John][-1]
+    assert "Пропущенный" in text and buttons == [[("📲 Перезвонить", "/cb")]]
+    assert len(m.history.last(John)) == 1, "one history entry per missed call"
+
+
+@pytest.mark.asyncio
+async def test_ring_all_tells_the_others_who_took_the_call():
+    loop = asyncio.get_running_loop()
+    m = make_manager(loop, ring_all=True)
+    m.notifier = BotNotifier()
+    m.engine.behaviour[John] = "wait"
+    m.engine.behaviour[PETYA] = "wait"
+    call = FakeSipCall(loop, incoming=True)
+    task = asyncio.ensure_future(m._sip_incoming(m.accounts[0], call))
+    await settle()
+    m.engine.release(PETYA)
+    await asyncio.wait_for(task, 2)
+    await settle()
+    assert "принял Petya" in m.notifier.closed[John][-1][0]
+    assert "Разговор с" in m.notifier.card_text[PETYA]
+
+
+@pytest.mark.asyncio
+async def test_privacy_settings_that_block_the_gateway_are_explained():
+    """The user cannot be reached in Telegram: say why, instead of a silent miss."""
+    loop = asyncio.get_running_loop()
+    m = make_manager(loop)
+    m.engine.behaviour[John] = "privacy"
+    await m.handle_text(John, "101")
+    await settle()
+    assert "конфиденциальности" in m.notifier.texts(John)[-1] and not m.accounts[0].sip.invites
+    call = FakeSipCall(loop, incoming=True)
+    await m._sip_incoming(m.accounts[0], call)
+    await settle()
+    missed = m.notifier.texts(John)[-1]
+    assert "Пропущенный" in missed and "конфиденциальности" in missed and call.rejected == 480
+
+
+@pytest.mark.asyncio
+async def test_card_shows_the_conference_and_the_key():
+    """A peer adding people in Telegram turns the call into a conference; the SIP leg stays in it."""
+    loop = asyncio.get_running_loop()
+    m = make_manager(loop)
+    call = FakeSipCall(loop, incoming=True)
+    await m._sip_incoming(m.accounts[0], call)
+    await settle()
+    tg = m.users[John].tg
+    tg.emojis = "🐶🍕🚗🎸"
+    tg.conference = object()
+    tg.others = 2
+    tg.on_update(tg)
+    await settle()
+    tg.on_update(tg)
+    await settle()
+    assert sum("стал групповым" in t for t in m.notifier.texts(John)) == 1
+    text = m.card_for(John)[0]
+    assert "участников: 2" in text and "🔐 Ключ: 🐶🍕🚗🎸" in text
+    assert call.state == CallState.CONNECTED and m.users[John].tg is tg
+
+
+@pytest.mark.asyncio
+async def test_failed_move_into_a_telegram_group_call_is_explained():
+    loop = asyncio.get_running_loop()
+    m = make_manager(loop)
+    call = FakeSipCall(loop, incoming=True)
+    await m._sip_incoming(m.accounts[0], call)
+    await settle()
+    m.users[John].tg.end("conference failed")
+    await settle()
+    assert any("Не удалось перейти в групповой звонок" in t for t in m.notifier.texts(John))
+    assert call.state == CallState.TERMINATED and m.users[John].reconnect_task is None

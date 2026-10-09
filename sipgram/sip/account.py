@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import ipaddress
 import logging
 import random
 import re
@@ -404,6 +405,8 @@ class SipAccount:
             self.transport.on_disconnect = self._on_transport_lost
         self.ports = RtpPortPool(cfg.rtp_port_min, cfg.rtp_port_max)
         self.codecs: list[SdpCodec] = codec_list(cfg.codecs)
+        self.allow_from = [ipaddress.ip_network(a, strict=False) for a in cfg.allow_from]
+        self._refused: set[str] = set()
         self._calls: dict[str, SipCall] = {}
         self._client_txns: dict[str, ClientTxn] = {}
         self._server_txns: dict[tuple[str, str], tuple[SipMessage, float]] = {}
@@ -772,6 +775,12 @@ class SipAccount:
             return
         call = self._calls.get(req.call_id)
         method = req.method or ""
+        if call is None and method in ("INVITE", "MESSAGE") and not self._trusted(addr[0]):
+            if addr[0] not in self._refused and len(self._refused) < 1000:
+                self._refused.add(addr[0])
+                log.warning("%s from %s ignored: calls are taken only from the PBX at %s "
+                            "(add the address to sip.allow_from if the PBX sends from it)", method, addr[0], self.server_addr[0])
+            return
         if method == "INVITE":
             if call is None:
                 self._handle_new_invite(req, addr)
@@ -816,6 +825,16 @@ class SipAccount:
             self._send_response(self._response_for(req, 501), req)
         else:
             self._send_response(self._response_for(req, 405), req)
+
+    def _trusted(self, host: str) -> bool:
+        """The gateway does not authenticate incoming requests, so new calls and messages come only from the PBX."""
+        if host == self.server_addr[0]:
+            return True
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            return False
+        return any(ip in net for net in self.allow_from)
 
     def _handle_new_invite(self, req: SipMessage, addr: tuple[str, int]) -> None:
         if not req.body:

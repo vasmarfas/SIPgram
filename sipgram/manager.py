@@ -107,6 +107,8 @@ class UserState:
         self.bridge: CallBridge | None = None
         self.pending_number: tuple[str, float] | None = None
         self.reconnect_task: asyncio.Task | None = None
+        self.ringing: tuple[str, str] | None = None        # caller and line of an incoming call still ringing
+        self.announced: TgCall | None = None
         self.lock = asyncio.Lock()
         self.rules = cfg.rules
         self._dnd = bool(self.prefs.get(self.id, "dnd", False))
@@ -263,6 +265,26 @@ class CallManager:
             await self.alerts.telegram_problem("call", reason)
             await self.alerts.call_failed(u.name, peer, reason)
 
+    @staticmethod
+    def _tg_problem(u: UserState, e: TgCallError) -> str:
+        """What the user should know when the gateway could not reach them in Telegram; "" for a plain miss."""
+        reason = e.reason.lower()
+        if "privacy" in reason:
+            return u.t("tg_privacy")
+        if "blocked" in reason:
+            return u.t("tg_blocked")
+        if "flood" in reason:
+            return u.t("tg_flood")
+        if "did not connect" in reason:
+            return u.t("tg_no_media")
+        return ""
+
+    @staticmethod
+    def _sip_reason(u: UserState, code: int, text: str) -> str:
+        key = f"sip_{code}"
+        human = u.t(key)
+        return f"{human} ({code})" if human != key else f"{code} {text}".strip()
+
     def lang_of(self, user_id: int) -> str:
         u = self.users.get(user_id)
         return u.lang if u else default_language()
@@ -316,8 +338,13 @@ class CallManager:
 
     def card_for(self, uid: int) -> tuple[str, Buttons | None, bool] | None:
         u = self.users.get(uid)
-        if u is None or (not u.legs() and u.tg is None):
+        if u is None:
             return None
+        if not u.legs():
+            if u.ringing is None:
+                return None
+            caller, account = u.ringing
+            return u.t("incoming", caller=caller, account=account), [[(u.t("btn_decline"), "/decline-incoming")]], False
         lines: list[str] = []
         buttons: Buttons = []
         keypad_ok = False
@@ -328,6 +355,11 @@ class CallManager:
                 keypad_ok = True
             else:
                 lines.append(u.t("card_dialing", number=u.active.peer))
+        tg = u.tg
+        if tg is not None and tg.conference is not None:
+            lines.append(u.t("card_conference", n=tg.others))
+        if tg is not None and tg.emojis:
+            lines.append(u.t("card_key", emojis=tg.emojis))
         if u.held:
             lines.append(u.t("card_held", peer=u.held.peer))
         if u.waiting:
@@ -341,13 +373,24 @@ class CallManager:
             buttons.append([(u.t("btn_hangup"), "/hangup")])
         return "\n".join(lines) or u.t("status_idle"), buttons, keypad_ok
 
-    async def _update_card(self, u: UserState) -> None:
+    async def _update_card(self, u: UserState, closing: tuple[str, Buttons | None] | None = None,
+                           announce: bool = True) -> bool:
+        """Redraws the live call card and tells whether the user has one.
+
+        `closing` is the last word about a call. When nothing else is going on it replaces the card, so
+        a call leaves one message in the chat; otherwise, or without the bot, it goes out as a message
+        of its own, unless `announce` is off.
+        """
         spec = self.card_for(u.id)
         if spec is None:
-            await self.notifier.clear_card(u.id)
-            return
+            text, buttons = closing or (u.t("call_ended_short"), None)
+            if not await self.notifier.close_card(u.id, text, buttons) and closing is not None and announce:
+                await self._notify(u, *closing)
+            return False
+        if closing is not None and announce:
+            await self._notify(u, *closing)
         text, buttons, keypad_ok = spec
-        await self.notifier.card(u.id, text, buttons, keypad_ok)
+        return await self.notifier.card(u.id, text, buttons, keypad_ok)
 
     async def _notify(self, u: UserState, text: str, buttons: Buttons | None = None) -> None:
         await self.notifier.send(u.id, text, buttons)
@@ -417,7 +460,9 @@ class CallManager:
         for u in users:
             u.tg_pending = True
             if self.calls.notify_incoming:
-                await self._notify(u, u.t("incoming", caller=caller, account=rt.name), [[(u.t("btn_decline"), "/decline-incoming")]])
+                u.ringing = (caller, rt.name)
+                if not await self._update_card(u):
+                    await self._notify(u, u.t("incoming", caller=caller, account=rt.name), [[(u.t("btn_decline"), "/decline-incoming")]])
         tasks: dict[asyncio.Task, UserState] = {}
         for u in users:
             task = self.loop.create_task(u.gw.engine.call(u.input_user, sample_rate=call.rate, ring_timeout=rt.cfg.ring_timeout))
@@ -442,38 +487,41 @@ class CallManager:
                         codes.append(e.sip_code if e.sip_code != 480 else TG_ERROR_TO_SIP.get(e.reason, 480))
                         u.tg_pending = False
                         await self._maybe_alert(u, caller, e)
-                        if e.reason in ("missed", "no answer") and self.calls.notify_incoming:
-                            await self._notify(u, u.t("missed", caller=caller, account=rt.name), [[(u.t("btn_callback"), "/cb")]])
-                        result = "missed" if e.reason in ("missed", "no answer") else e.reason
-                        self.history.add(u.id, record("in", call.caller_number or caller, rt.name, 0.0, result))
+                        missed = e.reason in ("missed", "no answer")
+                        self.history.add(u.id, record("in", call.caller_number or caller, rt.name, 0.0,
+                                                      "missed" if missed else e.reason))
+                        problem = self._tg_problem(u, e)
+                        declined = e.reason in ("hangup", "declined") and not problem
+                        await self._ring_over(u, caller, rt, missed=not declined, why=problem)
                     except Exception as e:
                         log.exception("telegram call task failed: %s", e)
                         u.tg_pending = False
                         codes.append(480)
+                        await self._ring_over(u, caller, rt, missed=True)
         finally:
             for task, u in tasks.items():
                 await u.gw.engine.cancel(u.id, "missed")
                 u.tg_pending = False
                 task.cancel()
+        left = list(tasks.values())
         if winner is None or tg_call is None:
             if call.active:
                 code = 486 if codes and all(c == 486 for c in codes) else (603 if codes and all(c == 603 for c in codes) else 480)
                 call.reject(code)
-            elif call.cancelled or not call.active:
-                for u in users:
-                    if self.calls.notify_incoming and u.tg_pending is False and u in users and not u.busy:
-                        pass
-                for u in users:
-                    self.history.add(u.id, record("in", call.caller_number or caller, rt.name, 0.0, "missed"))
-                    if self.calls.notify_incoming:
-                        await self._notify(u, u.t("missed", caller=caller, account=rt.name), [[(u.t("btn_callback"), "/cb")]])
+            for u in left:
+                self.history.add(u.id, record("in", call.caller_number or caller, rt.name, 0.0, "missed"))
+                await self._ring_over(u, caller, rt, missed=True)
             return
+        for u in left:
+            await self._ring_over(u, caller, rt, missed=False, taken_by=winner.name)
         u = winner
         u.tg_pending = False
         if not call.active:
             log.info("PBX gave up before %s answered", u.id)
             await tg_call.hangup("hangup")
+            await self._ring_over(u, caller, rt, missed=True)
             return
+        u.ringing = None
         leg = Leg(call, rt, "in", caller, call.caller_number, u)
         call.tag = leg
         async with u.lock:
@@ -482,6 +530,22 @@ class CallManager:
             self._attach(u, leg)
             call.answer()
         await self._update_card(u)
+
+    async def _ring_over(self, u: UserState, caller: str, rt: AccountRuntime, missed: bool,
+                         why: str = "", taken_by: str = "") -> None:
+        """Closes the incoming call card of a user who did not take the call."""
+        if u.ringing is None:
+            return
+        u.ringing = None
+        if missed:
+            text = u.t("missed", caller=caller, account=rt.name)
+            if why:
+                text += "\n" + u.t("missed_reason", reason=why)
+            await self._update_card(u, (text, [[(u.t("btn_callback"), "/cb")]]))
+        elif taken_by:
+            await self._update_card(u, (u.t("taken_by", caller=caller, name=taken_by), None), announce=False)
+        else:
+            await self._update_card(u, (u.t("declined", caller=caller), [[(u.t("btn_callback"), "/cb")]]), announce=False)
 
     async def _offer_waiting(self, u: UserState, rt: AccountRuntime, call: SipCall) -> None:
         if not self.calls.call_waiting or u.waiting or u.held or u.reconnect_task or u.tg is None:
@@ -568,6 +632,9 @@ class CallManager:
         except TgCallError as e:
             log.info("callback to %s failed: %s", u.id, e)
             u.tg_pending = False
+            problem = self._tg_problem(u, e)
+            if problem:
+                await self._notify(u, u.t("callback_failed", reason=problem))
             return
         async with u.lock:
             u.tg_pending = False
@@ -593,6 +660,9 @@ class CallManager:
             log.info("direct mode: telegram leg to %s failed: %s", u.id, e)
             u.tg_pending = False
             await call.hangup()
+            problem = self._tg_problem(u, e)
+            if problem:
+                await self._notify(u, u.t("callback_failed", reason=problem))
             return
         async with u.lock:
             u.tg_pending = False
@@ -680,12 +750,24 @@ class CallManager:
         self.loop.create_task(waiter())
 
     def _watch_tg(self, u: UserState, tg_call: TgCall) -> None:
+        tg_call.on_update = lambda c: self.loop.create_task(self._tg_updated(u, c))
+
         async def waiter() -> None:
             reason = await tg_call.ended
             if u.tg is tg_call:
                 await self._tg_ended(u, tg_call, reason)
 
         self.loop.create_task(waiter())
+
+    async def _tg_updated(self, u: UserState, tg_call: TgCall) -> None:
+        """The emoji key or the conference participants changed. A peer adding people in Telegram turns
+        the private call into a conference; the SIP leg stays bridged to it."""
+        if u.tg is not tg_call:
+            return
+        if tg_call.conference is not None and tg_call.invite_msg_id is None and u.announced is not tg_call:
+            u.announced = tg_call
+            await self._notify(u, u.t("tg_conference"))
+        await self._update_card(u)
 
     def _leg_state(self, leg: Leg, state: CallState) -> None:
         if state == CallState.CONNECTED and not leg.connected_notified:
@@ -744,8 +826,11 @@ class CallManager:
                 return
             u.active = None
             self._stop_bridge(u, leg.peer)
+            closing = None
             if leg.direction == "out" and not connected and call.end_code >= 300 and u.tg is not None:
-                await self._notify(u, u.t("dial_failed", number=leg.peer, reason=f"{call.end_code} {call.end_reason}"))
+                reason = self._sip_reason(u, call.end_code, call.end_reason)
+                await self._update_card(u, (u.t("dial_failed", number=leg.peer, reason=reason),
+                                            [[(u.t("btn_redial"), "/redial")]]))
                 if u.held is None and u.waiting is None:
                     tone_bridge = CallBridge(call, u.tg, self.calls.jitter_ms)
                     tone_bridge.play_tone(tones.busy(self.calls.ringback, u.tg.sample_rate))
@@ -753,8 +838,8 @@ class CallManager:
                     await asyncio.sleep(2.0)
                     tone_bridge.stop()
             elif connected and leg.result == "answered":
-                await self._notify(u, u.t("call_ended", peer=leg.peer, duration=fmt_duration(time.time() - connected)),
-                                   self._after_call_buttons(leg))
+                closing = (u.t("call_ended", peer=leg.peer, duration=fmt_duration(time.time() - connected)),
+                           self._after_call_buttons(leg))
             if u.held is not None:
                 await self._resume_held(u)
             elif u.waiting is not None and u.tg is not None:
@@ -770,7 +855,7 @@ class CallManager:
                 tg = u.tg
                 u.tg = None
                 await tg.hangup("hangup")
-        await self._update_card(u)
+        await self._update_card(u, closing)
 
     def _after_call_buttons(self, leg: Leg) -> Buttons:
         u = leg.user
@@ -798,6 +883,8 @@ class CallManager:
         if can_reconnect:
             u.reconnect_task = self.loop.create_task(self._reconnect(u))
             return
+        if reason == "conference failed":
+            await self._notify(u, u.t("tg_conference_failed"))
         await self._end_everything(u, f"telegram {reason}")
 
     async def _reconnect(self, u: UserState) -> None:
@@ -845,6 +932,7 @@ class CallManager:
             if u.tg_pending:
                 await u.gw.engine.cancel(u.id, "missed")
                 u.tg_pending = False
+        summaries: list[tuple[str, Buttons]] = []
         for leg in legs:
             if leg.call.active:
                 if leg.direction == "in" and leg.call.state in (CallState.NEW, CallState.RINGING):
@@ -853,13 +941,15 @@ class CallManager:
                 else:
                     await leg.call.hangup()
             if notify and leg.call.connected_at and leg.result in ("", "answered"):
-                await self._notify(u, u.t("call_ended", peer=leg.peer, duration=fmt_duration(time.time() - leg.call.connected_at)),
-                                   self._after_call_buttons(leg))
+                summaries.append((u.t("call_ended", peer=leg.peer, duration=fmt_duration(time.time() - leg.call.connected_at)),
+                                  self._after_call_buttons(leg)))
                 leg.result = "answered"
         if tg is not None and tg.active:
             await tg.hangup("hangup")
         log.info("user %s: all calls ended (%s)", u.id, reason)
-        await self._update_card(u)
+        for text, buttons in summaries[:-1]:
+            await self._notify(u, text, buttons)
+        await self._update_card(u, summaries[-1] if summaries else None)
 
     # ---- commands (text from the account chat, text or buttons from the bot) ----
 
@@ -1175,13 +1265,15 @@ class CallManager:
         self.group_calls.pop(session.gateway, None)
         await session.call.leave()
 
+    def _group_text(self, u: UserState, session: GroupSession, key: str, **kw) -> str:
+        if session.call.conference:
+            return u.t(f"{key}_conference", **kw)
+        return u.t(key, chat=session.call.title, **kw)
+
     async def _group(self, u: UserState, arg: str) -> None:
-        """Moves the conversation into the voice chat of the configured group, where anyone in that
-        group can join, including people who have no extension on the PBX."""
-        chat = self.calls.group_chat
-        if not chat:
-            await self._notify(u, u.t("group_no_chat"))
-            return
+        """Moves the conversation into a Telegram group call: the voice chat of the configured group, or a
+        conference call when no group is configured. Anyone invited can join, including people who have
+        no extension on the PBX."""
         if u.gw is None:
             await self._notify(u, u.t("no_line"))
             return
@@ -1195,9 +1287,14 @@ class CallManager:
             await self._notify(u, u.t("group_ended"))
             return
         if session is None:
-            await self._notify(u, u.t("group_joining", chat=chat))
+            chat = self.calls.group_chat
             try:
-                call = await u.gw.engine.join_group(chat, self.calls.group_title)
+                if chat:
+                    await self._notify(u, u.t("group_joining", chat=chat))
+                    call = await u.gw.engine.join_group(chat, self.calls.group_title)
+                else:
+                    await self._notify(u, u.t("conf_tg_starting"))
+                    call = await u.gw.engine.create_conference(self.calls.group_title)
             except Exception as e:
                 await self._notify(u, u.t("group_failed", reason=str(e)))
                 return
@@ -1208,7 +1305,7 @@ class CallManager:
             self.loop.create_task(self._watch_group(session))
         moved = [leg.peer for leg in await self._move_to_group(u, session)]
         if moved:
-            await self._notify(u, u.t("group_moved", peers=", ".join(moved), chat=session.call.title))
+            await self._notify(u, self._group_text(u, session, "group_moved", peers=", ".join(moved)))
         await self._invite_to_group(u, session, arg)
         await self._update_card(u)
 
@@ -1251,7 +1348,7 @@ class CallManager:
         failed = await session.call.invite([user for user, _ in targets])
         invited = [name for user, name in targets if str(user.user_id) not in failed]
         if invited:
-            await self._notify(u, u.t("group_invited", chat=session.call.title, who=", ".join(invited)))
+            await self._notify(u, self._group_text(u, session, "group_invited", who=", ".join(invited)))
         else:
             await self._notify(u, u.t("group_invite_failed", who=", ".join(name for _, name in targets),
                                       reason="telegram"))
@@ -1274,7 +1371,7 @@ class CallManager:
         session.legs.append(leg)
         session.bridge.add(call)
         self._watch_leg(leg)
-        await self._notify(u, u.t("group_moved", peers=fmt_number(number), chat=session.call.title))
+        await self._notify(u, self._group_text(u, session, "group_moved", peers=fmt_number(number)))
 
     async def _watch_group(self, session: GroupSession) -> None:
         await session.call.ended
@@ -1339,7 +1436,7 @@ class CallManager:
             lines.append(u.t("status_waiting", caller=u.waiting.peer))
         session = self.group_calls.get(u.gw.name) if u.gw else None
         if session is not None:
-            lines.append(u.t("status_group", chat=session.call.title, n=len(session.legs)))
+            lines.append(self._group_text(u, session, "status_group", n=len(session.legs)))
         if not u.legs():
             lines.append(u.t("status_idle"))
         return "\n".join(lines)
@@ -1358,7 +1455,7 @@ class CallManager:
         if r.whitelist:
             lines.append(u.t("schedule_whitelist", numbers=", ".join(r.whitelist)))
         lines.append(u.t("schedule_forward", number=fmt_number(r.forward)) if r.forward
-                     else u.t("schedule_action", action=r.action))
+                     else u.t("schedule_action", action=u.t(f"action_{r.action}")))
         lines.append(u.t("schedule_closed") if time_closed(r) else u.t("schedule_open"))
         return "\n".join(lines)
 

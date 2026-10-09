@@ -19,7 +19,7 @@ def test_every_string_renders_in_both_languages():
                   gateway="@gw", icon="🟢", username="491", domain="pbx", state="ok", direction="in", bot="@bot",
                   seconds=60, users=2, accounts=1, what="session", room="8000", user="Иван",
                   windows="mon-fri 09:00-18:00", numbers="+7999*", action="busy", title="SIPgram", chat="@team",
-                  peers="+7 999, 101", who="@petya")
+                  peers="+7 999, 101", who="@petya", emojis="🐶🍕🚗🎸")
     for lang in LANGUAGES:
         for key in STRINGS[lang]:
             out = t(key, lang, **sample)

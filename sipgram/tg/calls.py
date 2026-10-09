@@ -1,10 +1,14 @@
-"""Telegram private (P2P) calls on top of NTgCalls + Telethon raw API.
+"""Telegram private (P2P) calls and conference calls on top of NTgCalls + Telethon raw API.
 
 Flow (outgoing):  create_p2p_call -> init_exchange -> phone.requestCall -> phoneCallAccepted(g_b)
                   -> exchange_keys -> phone.confirmCall -> connect_p2p -> CONNECTED
 Flow (incoming):  phoneCallRequested(g_a_hash) -> phone.receivedCall -> [accept] create_p2p_call
                   -> init_exchange(g_a_hash) -> phone.acceptCall(g_b) -> phoneCall(g_a, fingerprint)
                   -> exchange_keys -> connect_p2p -> CONNECTED
+Conference:       the peer adds people to the call and discards it with phoneCallDiscardReasonMigrateConferenceCall,
+                  or invites the gateway with a messageActionConferenceCall. Last chain block -> init_conference
+                  (keeps the media of the private call) -> phone.joinGroupCall(public_key, block) -> connect.
+                  From then on NTgCalls asks for chain blocks and for the owners of unknown SSRCs.
 Audio is exchanged as 10 ms PCM16 frames at `sample_rate` (NTgCalls resamples to Opus internally).
 """
 from __future__ import annotations
@@ -23,10 +27,12 @@ from telethon.tl import functions, types
 
 from .account import TgAccount
 from .group import GROUP_RATE, TgGroupCall, input_group_call
+from .media import FrameSender, external_audio, merge_frames
 
 log = logging.getLogger("sipgram.tg.calls")
 
 CONNECT_TIMEOUT = 20.0
+CONFERENCE_KEY_BASE = -(1 << 60)
 
 
 class TgCallError(Exception):
@@ -61,6 +67,32 @@ def _map_rpc_error(e: RPCError) -> TgCallError:
     return TgCallError(f"telegram error: {msg}", 480)
 
 
+def _discard_reason(reason: str) -> types.TypePhoneCallDiscardReason:
+    return {
+        "busy": types.PhoneCallDiscardReasonBusy(),
+        "missed": types.PhoneCallDiscardReasonMissed(),
+        "no answer": types.PhoneCallDiscardReasonMissed(),
+        "disconnect": types.PhoneCallDiscardReasonDisconnect(),
+    }.get(reason, types.PhoneCallDiscardReasonHangup())
+
+
+class Conference:
+    """One E2E conference the gateway sits in, under its NTgCalls key."""
+
+    def __init__(self, key: int, ref, loop: asyncio.AbstractEventLoop):
+        self.key = key
+        self.ref = ref                                    # slug or invite message until the call id is known
+        self.call: types.InputGroupCall | None = None
+        self.joined = False
+        self.sources: dict[int, int] = {}                 # participant id -> audio SSRC
+        self.seen_others = False
+        self.connected: asyncio.Future = loop.create_future()
+
+    @property
+    def input(self):
+        return self.call or self.ref
+
+
 class TgCall:
     def __init__(self, engine: TgCallEngine, user_id: int, outgoing: bool, sample_rate: int):
         self.engine = engine
@@ -71,6 +103,9 @@ class TgCall:
         self.call_id: int | None = None
         self.access_hash: int | None = None
         self.g_a_hash: bytes | None = None
+        self.invite_msg_id: int | None = None
+        self.conference: Conference | None = None
+        self.emojis = ""
         self.video = False
         self.created = time.time()
         self.connected_at = 0.0
@@ -80,11 +115,14 @@ class TgCall:
         self._accepted: asyncio.Future = engine.loop.create_future()
         self._confirmed: asyncio.Future = engine.loop.create_future()
         self._media_ready = False
+        self._migrating = False
         self._sig_in: list[bytes] = []
         self._sig_out: asyncio.Queue = asyncio.Queue()
         self._sig_task: asyncio.Task | None = None
+        self.sender = FrameSender(engine.ntg, user_id)
         self.on_state: Callable[[TgCall, TgCallState], None] | None = None
         self.on_audio: Callable[[bytes], None] | None = None
+        self.on_update: Callable[[TgCall], None] | None = None
         self.frames_in = 0
         self.frames_out = 0
         self.library_version = ""
@@ -97,6 +135,13 @@ class TgCall:
     def peer(self) -> types.InputPhoneCall:
         assert self.call_id is not None and self.access_hash is not None
         return types.InputPhoneCall(id=self.call_id, access_hash=self.access_hash)
+
+    @property
+    def others(self) -> int:
+        """Telegram participants besides the gateway: 1 in a private call."""
+        if self.conference is None:
+            return 1
+        return sum(1 for uid in self.conference.sources if uid != self.engine.my_id)
 
     def _set_state(self, state: TgCallState) -> None:
         if self.state == state or self.state == TgCallState.ENDED:
@@ -111,6 +156,13 @@ class TgCall:
             except Exception:
                 log.exception("tg on_state failed")
 
+    def _updated(self) -> None:
+        if self.on_update and not self._migrating:
+            try:
+                self.on_update(self)
+            except Exception:
+                log.exception("tg on_update failed")
+
     def frame_bytes(self) -> int:
         return self.sample_rate * 2 // 100
 
@@ -118,19 +170,8 @@ class TgCall:
         """Push one 10 ms PCM16 frame toward Telegram (call from the event loop thread)."""
         if not self._media_ready or self.state == TgCallState.ENDED:
             return
-        try:
-            fut = self.engine.ntg.send_external_frame(
-                self.user_id, ntgcalls.StreamDevice.MICROPHONE, pcm10ms, ntgcalls.FrameData(0, 0, 0, 0)
-            )
-            fut.add_done_callback(self._frame_done)
-            self.frames_out += 1
-        except Exception as e:
-            log.debug("send_external_frame failed: %s", e)
-
-    @staticmethod
-    def _frame_done(fut: asyncio.Future) -> None:
-        if not fut.cancelled() and fut.exception() is not None:
-            log.debug("external frame error: %s", fut.exception())
+        self.sender.push(pcm10ms)
+        self.frames_out += 1
 
     async def set_sample_rate(self, rate: int) -> None:
         if rate == self.sample_rate:
@@ -154,16 +195,26 @@ class TgCallEngine:
         self.ntg = ntgcalls.NTgCalls()
         self.calls: dict[int, TgCall] = {}
         self.groups: dict[int, TgGroupCall] = {}
+        self.conferences: dict[int, Conference] = {}
         self.on_incoming: Callable[[TgCall], Awaitable[None] | None] | None = None
         self._protocol = ntgcalls.NTgCalls.get_protocol()
+        self._created_conferences = 0
         self.ntg.on_connection_change(self._on_connection_change)
         self.ntg.on_frames(self._on_frames)
-        self.ntg.on_signaling(self._on_signaling)
+        self.ntg.on_signaling_data(self._on_signaling)
+        self.ntg.on_update_emojis(self._on_emojis)
+        self.ntg.on_outbound_block(self._on_outbound_block)
+        self.ntg.on_subchain_request(self._on_subchain_request)
+        self.ntg.on_request_participants(self._on_request_participants)
         account.add_raw_handler(self._on_raw_update)
 
     @property
     def library_versions(self) -> list[str]:
         return list(self._protocol.library_versions)
+
+    @property
+    def my_id(self) -> int:
+        return self.account.me.id if self.account.me else 0
 
     def tl_protocol(self) -> types.PhoneCallProtocol:
         return types.PhoneCallProtocol(
@@ -184,12 +235,12 @@ class TgCallEngine:
     # ---- media ----
 
     async def _configure_media(self, call: TgCall) -> None:
-        desc = ntgcalls.AudioDescription(ntgcalls.MediaSource.EXTERNAL, call.sample_rate, 1, "", False)
-        await self.ntg.set_stream_sources(call.user_id, ntgcalls.StreamMode.CAPTURE, ntgcalls.MediaDescription(microphone=desc))
-        await self.ntg.set_stream_sources(call.user_id, ntgcalls.StreamMode.PLAYBACK, ntgcalls.MediaDescription(microphone=desc))
+        media = external_audio(call.sample_rate)
+        await self.ntg.set_stream_sources(call.user_id, ntgcalls.StreamMode.CAPTURE, media)
+        await self.ntg.set_stream_sources(call.user_id, ntgcalls.StreamMode.PLAYBACK, media)
         call._media_ready = True
 
-    # ---- group calls (voice chats) ----
+    # ---- group calls (voice chats and conferences started by the gateway) ----
 
     async def join_group(self, chat: str, title: str = "") -> TgGroupCall:
         """Joins (or starts) the voice chat of `chat` and returns once media is connected."""
@@ -202,8 +253,7 @@ class TgCallEngine:
         self.groups[key] = group
         try:
             payload = await self.ntg.create_call(key)
-            desc = ntgcalls.AudioDescription(ntgcalls.MediaSource.EXTERNAL, GROUP_RATE, 1, "", False)
-            media = ntgcalls.MediaDescription(microphone=desc)
+            media = external_audio(GROUP_RATE)
             await self.ntg.set_stream_sources(key, ntgcalls.StreamMode.CAPTURE, media)
             await self.ntg.set_stream_sources(key, ntgcalls.StreamMode.PLAYBACK, media)
             try:
@@ -216,12 +266,7 @@ class TgCallEngine:
             params = self._join_params(result)
             if params is None:
                 raise TgCallError("telegram did not return the voice chat connection parameters", 480)
-            await self.ntg.connect(key, params, False)
-            group.joined = True
-            try:
-                await asyncio.wait_for(asyncio.shield(group.connected), CONNECT_TIMEOUT)
-            except asyncio.TimeoutError:
-                raise TgCallError("voice chat media did not connect", 480) from None
+            await self._connect_group(group, params)
             log.info("joined the voice chat of %s (%d)", name, key)
             return group
         except TgCallError:
@@ -231,6 +276,53 @@ class TgCallEngine:
             log.exception("joining the voice chat failed")
             await self.leave_group(group, "failed")
             raise TgCallError(f"voice chat: {e}", 480) from e
+
+    async def create_conference(self, title: str = "") -> TgGroupCall:
+        """Starts an E2E conference call: a Telegram group call that needs no group."""
+        self._created_conferences += 1
+        key = CONFERENCE_KEY_BASE - self._created_conferences
+        group = TgGroupCall(self, key, None, types.InputPeerSelf(), title or "Telegram", conference=True)
+        self.groups[key] = group
+        conf = self.conferences[key] = Conference(key, None, self.loop)
+        try:
+            await self.ntg.create_p2p_call(key)
+            params = await self.ntg.init_conference(key, self.my_id, None)
+            media = external_audio(GROUP_RATE)
+            await self.ntg.set_stream_sources(key, ntgcalls.StreamMode.CAPTURE, media)
+            await self.ntg.set_stream_sources(key, ntgcalls.StreamMode.PLAYBACK, media)
+            try:
+                result = await self.account.invoke(functions.phone.CreateConferenceCallRequest(
+                    random_id=random.randint(1, 0x7FFFFFFE), muted=False, video_stopped=True, join=True,
+                    public_key=int.from_bytes(params.public_key, "little", signed=True), block=params.block,
+                    params=types.DataJSON(data=params.payload),
+                ))
+            except RPCError as e:
+                raise _map_rpc_error(e) from e
+            data, blocks = self._absorb(conf, result)
+            if data is None or conf.call is None:
+                raise TgCallError("telegram did not return the conference connection parameters", 480)
+            group.call = conf.call
+            conf.joined = True
+            await self._connect_group(group, data)
+            for update in blocks:
+                await self._apply_blocks(conf, update, from_short_poll=False)
+            log.info("started conference call %d", conf.call.id)
+            return group
+        except TgCallError:
+            await self.leave_group(group, "failed")
+            raise
+        except Exception as e:
+            log.exception("starting the conference call failed")
+            await self.leave_group(group, "failed")
+            raise TgCallError(f"conference call: {e}", 480) from e
+
+    async def _connect_group(self, group: TgGroupCall, params: str) -> None:
+        await self.ntg.connect(group.key, params, False)
+        group.joined = True
+        try:
+            await asyncio.wait_for(asyncio.shield(group.connected), CONNECT_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise TgCallError("group call media did not connect", 480) from None
 
     @staticmethod
     def _join_params(result) -> str | None:
@@ -242,12 +334,13 @@ class TgCallEngine:
     async def leave_group(self, group: TgGroupCall, reason: str = "hangup") -> None:
         if not group.active:
             return
-        if group.joined:
+        if group.joined and group.call is not None:
             try:
                 await self.account.invoke(functions.phone.LeaveGroupCallRequest(call=group.call, source=0))
             except RPCError as e:
                 log.debug("leaveGroupCall failed: %s", e)
         group.joined = False
+        self.conferences.pop(group.key, None)
         try:
             await self.ntg.stop(group.key)
         except Exception:
@@ -259,7 +352,186 @@ class TgCallEngine:
             group.ended.set_result(reason)
         if self.groups.get(group.key) is group:
             self.groups.pop(group.key, None)
-        log.info("left the voice chat of %s (%s)", group.title, reason)
+        log.info("left the group call %s (%s)", group.title, reason)
+
+    # ---- conferences ----
+
+    async def _migrate(self, call: TgCall, slug: str) -> None:
+        """The peer turned the private call into a conference to add people: follow it there."""
+        log.info("tg call with %s moves into conference %s", call.user_id, slug)
+        if call._sig_task:
+            call._sig_out.put_nowait(None)
+            call._sig_task = None
+        try:
+            await self._join_conference(call, types.InputGroupCallSlug(slug=slug))
+            await asyncio.wait_for(asyncio.shield(call.conference.connected), CONNECT_TIMEOUT)
+        except Exception as e:
+            log.warning("tg call with %s could not follow it into the conference: %s", call.user_id, e)
+            joined = call.conference is not None and call.conference.joined
+            await self._end_call(call, "conference failed", local=joined)
+            return
+        finally:
+            call._migrating = False
+        log.info("tg call with %s continues as a conference", call.user_id)
+        call._updated()
+
+    async def _join_conference(self, call: TgCall, ref) -> None:
+        """Joins the conference `ref` points at, taking over the media of `call`."""
+        key = call.user_id
+        conf = call.conference = self.conferences[key] = Conference(key, ref, self.loop)
+        last_block = await self._last_block(ref)
+        if last_block is None:
+            raise TgCallError("the conference has no chain block to join from", 480)
+        try:
+            params = await self.ntg.init_conference(key, self.my_id, last_block)
+        except ntgcalls.ConnectionNotFound:
+            await self.ntg.create_p2p_call(key)
+            params = await self.ntg.init_conference(key, self.my_id, last_block)
+        await self._configure_media(call)
+        try:
+            result = await self.account.invoke(functions.phone.JoinGroupCallRequest(
+                call=ref, join_as=types.InputPeerSelf(), params=types.DataJSON(data=params.payload),
+                muted=False, video_stopped=True,
+                public_key=int.from_bytes(params.public_key, "little", signed=True), block=params.block,
+            ))
+        except RPCError as e:
+            raise _map_rpc_error(e) from e
+        conf.joined = True
+        data, blocks = self._absorb(conf, result)
+        if data is None:
+            raise TgCallError("telegram did not return the conference connection parameters", 480)
+        await self.ntg.connect(key, data, False)
+        for update in blocks:
+            await self._apply_blocks(conf, update, from_short_poll=False)
+        await self._refresh_participants(conf)
+
+    @staticmethod
+    def _absorb(conf: Conference, result) -> tuple[str | None, list]:
+        """Picks the call id, the connection parameters and the first chain blocks out of a join result."""
+        data = None
+        blocks = []
+        for update in getattr(result, "updates", []):
+            if isinstance(update, types.UpdateGroupCall) and isinstance(update.call, types.GroupCall):
+                conf.call = types.InputGroupCall(id=update.call.id, access_hash=update.call.access_hash)
+            elif isinstance(update, types.UpdateGroupCallConnection) and not update.presentation:
+                data = update.params.data
+            elif isinstance(update, types.UpdateGroupCallChainBlocks):
+                blocks.append(update)
+        return data, blocks
+
+    async def _last_block(self, ref) -> bytes | None:
+        try:
+            result = await self.account.invoke(functions.phone.GetGroupCallChainBlocksRequest(
+                call=ref, sub_chain_id=0, offset=-1, limit=1,
+            ))
+        except RPCError as e:
+            raise _map_rpc_error(e) from e
+        for update in getattr(result, "updates", []):
+            if isinstance(update, types.UpdateGroupCallChainBlocks) and update.blocks:
+                return update.blocks[-1]
+        return None
+
+    async def _apply_blocks(self, conf: Conference, update: types.UpdateGroupCallChainBlocks, from_short_poll: bool) -> None:
+        try:
+            await self.ntg.apply_blocks(conf.key, update.sub_chain_id, update.next_offset, list(update.blocks), from_short_poll)
+        except Exception as e:
+            log.debug("conference %d: applying chain blocks failed: %s", conf.key, e)
+
+    async def _fetch_subchain(self, key: int, subchain: int, height: int, limit: int) -> None:
+        conf = self.conferences.get(key)
+        if conf is None:
+            return
+        try:
+            if conf.input is not None:
+                result = await self.account.invoke(functions.phone.GetGroupCallChainBlocksRequest(
+                    call=conf.input, sub_chain_id=subchain, offset=height, limit=limit,
+                ))
+                for update in getattr(result, "updates", []):
+                    if isinstance(update, types.UpdateGroupCallChainBlocks):
+                        await self._apply_blocks(conf, update, from_short_poll=True)
+        except RPCError as e:
+            log.debug("conference %d: chain blocks request failed: %s", key, e)
+        finally:
+            try:
+                await self.ntg.finish_subchain_request(key, subchain)
+            except Exception as e:
+                log.debug("conference %d: finishing the chain request failed: %s", key, e)
+
+    async def _broadcast_block(self, key: int, block: bytes) -> None:
+        conf = self.conferences.get(key)
+        if conf is None or conf.input is None:
+            return
+        try:
+            await self.account.invoke(functions.phone.SendConferenceCallBroadcastRequest(call=conf.input, block=block))
+        except RPCError as e:
+            log.debug("conference %d: broadcasting a chain block failed: %s", key, e)
+
+    async def _refresh_participants(self, conf: Conference) -> None:
+        """Reads who is in the conference: NTgCalls needs the owner of each SSRC to decrypt it."""
+        if conf.input is None:
+            return
+        sources: dict[int, int] = {}
+        offset = ""
+        try:
+            while True:
+                result = await self.account.invoke(functions.phone.GetGroupParticipantsRequest(
+                    call=conf.input, ids=[], sources=[], offset=offset, limit=100,
+                ))
+                for p in result.participants:
+                    if not p.left:
+                        sources[utils.get_peer_id(p.peer)] = p.source
+                offset = result.next_offset
+                if not offset or not result.participants:
+                    break
+        except RPCError as e:
+            log.debug("conference %d: reading participants failed: %s", conf.key, e)
+            return
+        conf.sources = sources
+        await self._participants_changed(conf)
+
+    async def _participants_changed(self, conf: Conference) -> None:
+        mappings = [ntgcalls.SsrcMapping(uid, ssrc) for uid, ssrc in conf.sources.items()]
+        try:
+            await self.ntg.update_audio_ssrc_mappings(conf.key, mappings)
+        except Exception as e:
+            log.debug("conference %d: SSRC mappings not taken: %s", conf.key, e)
+        call = self.calls.get(conf.key)
+        if call is None or call.conference is not conf or not call.active:
+            return
+        if call.others:
+            conf.seen_others = True
+        elif conf.seen_others and not call._migrating:
+            log.info("tg call with %s: everyone left the conference", call.user_id)
+            await self._end_call(call, "hangup", local=True)
+            return
+        call._updated()
+
+    def _conference_by_call(self, input_call) -> Conference | None:
+        call_id = getattr(input_call, "id", None)
+        if call_id is None:
+            return None
+        return next((c for c in self.conferences.values() if c.call is not None and c.call.id == call_id), None)
+
+    async def _conference_invite(self, msg: types.MessageService) -> None:
+        action = msg.action
+        if msg.out or action.missed or action.active or action.duration:
+            return
+        uid = utils.get_peer_id(msg.peer_id)
+        existing = self.calls.get(uid)
+        if existing and existing.active:
+            log.info("conference invite from %s while a call with them is active; declining", uid)
+            try:
+                await self.account.invoke(functions.phone.DeclineConferenceCallInviteRequest(msg_id=msg.id))
+            except RPCError:
+                pass
+            return
+        call = TgCall(self, uid, outgoing=False, sample_rate=self.default_rate)
+        call.invite_msg_id = msg.id
+        self.calls[uid] = call
+        call._set_state(TgCallState.INCOMING)
+        await self._offer_incoming(call)
+
+    # ---- P2P plumbing ----
 
     async def _dh_config(self) -> ntgcalls.DhConfig:
         dh = await self.account.invoke(functions.messages.GetDhConfigRequest(version=0, random_length=256))
@@ -282,11 +554,12 @@ class TgCallEngine:
         versions = list(pc.protocol.library_versions)
         call.library_version = max(versions, key=lambda v: [int(x) for x in v.split(".")]) if versions else "?"
         call._set_state(TgCallState.CONNECTING)
-        await self.ntg.connect_p2p(call.user_id, self._servers(pc.connections), versions, bool(pc.p2p_allowed))
+        custom = pc.custom_parameters.data if pc.custom_parameters else None
+        await self.ntg.connect_p2p(call.user_id, self._servers(pc.connections), versions, bool(pc.p2p_allowed), custom)
         call._sig_task = self.loop.create_task(self._signaling_pump(call))
         for data in call._sig_in:
             try:
-                await self.ntg.send_signaling(call.user_id, data)
+                await self.ntg.send_signaling_data(call.user_id, data)
             except Exception as e:
                 log.debug("replaying signaling failed: %s", e)
         call._sig_in.clear()
@@ -368,6 +641,14 @@ class TgCallEngine:
         uid = call.user_id
         try:
             call._set_state(TgCallState.ACCEPTING)
+            if call.invite_msg_id is not None:
+                await self._join_conference(call, types.InputGroupCallInviteMessage(msg_id=call.invite_msg_id))
+                call._set_state(TgCallState.CONNECTING)
+                try:
+                    await asyncio.wait_for(asyncio.shield(call.connected), CONNECT_TIMEOUT)
+                except asyncio.TimeoutError:
+                    raise TgCallError("conference media did not connect", 480) from None
+                return
             await self.ntg.create_p2p_call(uid)
             await self._configure_media(call)
             g_b = await self.ntg.init_exchange(uid, await self._dh_config(), call.g_a_hash)
@@ -398,16 +679,21 @@ class TgCallEngine:
 
     # ---- teardown ----
 
-    async def _discard(self, call: TgCall, reason) -> None:
-        if call.call_id is None:
-            return
-        duration = int(time.time() - call.connected_at) if call.connected_at else 0
+    async def _discard(self, call: TgCall, reason: str) -> None:
+        """Tells Telegram the call is over: leaves the conference, declines the invite or hangs up."""
+        conf = call.conference
         try:
-            await self.account.invoke(functions.phone.DiscardCallRequest(
-                peer=call.peer, duration=duration, reason=reason, connection_id=0, video=False,
-            ))
+            if conf is not None and conf.joined:
+                await self.account.invoke(functions.phone.LeaveGroupCallRequest(call=conf.input, source=0))
+            elif call.invite_msg_id is not None:
+                await self.account.invoke(functions.phone.DeclineConferenceCallInviteRequest(msg_id=call.invite_msg_id))
+            elif call.call_id is not None:
+                duration = int(time.time() - call.connected_at) if call.connected_at else 0
+                await self.account.invoke(functions.phone.DiscardCallRequest(
+                    peer=call.peer, duration=duration, reason=_discard_reason(reason), connection_id=0, video=False,
+                ))
         except RPCError as e:
-            log.debug("discardCall failed: %s", e)
+            log.debug("ending the telegram call failed: %s", e)
 
     async def _end_call(self, call: TgCall, reason: str, local: bool, notify_peer: bool = True) -> None:
         if call.state == TgCallState.ENDED:
@@ -415,13 +701,9 @@ class TgCallEngine:
         call.end_reason = reason
         call._media_ready = False
         if local and notify_peer:
-            tl_reason = {
-                "busy": types.PhoneCallDiscardReasonBusy(),
-                "missed": types.PhoneCallDiscardReasonMissed(),
-                "no answer": types.PhoneCallDiscardReasonMissed(),
-                "disconnect": types.PhoneCallDiscardReasonDisconnect(),
-            }.get(reason, types.PhoneCallDiscardReasonHangup())
-            await self._discard(call, tl_reason)
+            await self._discard(call, reason)
+        if self.conferences.get(call.user_id) is call.conference:
+            self.conferences.pop(call.user_id, None)
         try:
             await self.ntg.stop(call.user_id)
         except Exception:
@@ -429,7 +711,10 @@ class TgCallEngine:
         if call._sig_task:
             call._sig_out.put_nowait(None)
             call._sig_task = None
-        for fut in (call._accepted, call._confirmed, call.connected):
+        futures = [call._accepted, call._confirmed, call.connected]
+        if call.conference is not None:
+            futures.append(call.conference.connected)
+        for fut in futures:
             if not fut.done():
                 fut.set_exception(TgCallError(reason))
                 fut.exception()
@@ -447,9 +732,12 @@ class TgCallEngine:
         self.loop.call_soon_threadsafe(self._connection_changed, int(user_id), name)
 
     def _connection_changed(self, user_id: int, name: str) -> None:
+        conf = self.conferences.get(user_id)
+        if conf is not None and name == "CONNECTED" and not conf.connected.done():
+            conf.connected.set_result(True)
         group = self.groups.get(user_id)
         if group is not None:
-            log.info("voice chat %s: media %s", group.title, name)
+            log.info("group call %s: media %s", group.title, name)
             if name == "CONNECTED" and not group.connected.done():
                 group.connected.set_result(True)
             elif name in ("FAILED", "TIMEOUT", "CLOSED"):
@@ -464,7 +752,7 @@ class TgCallEngine:
                 call.connected.set_result(True)
             call._set_state(TgCallState.CONNECTED)
         elif name in ("FAILED", "TIMEOUT", "CLOSED"):
-            if call.state == TgCallState.ENDED:
+            if call.state == TgCallState.ENDED or call._migrating:
                 return
             self.loop.create_task(self._end_call(call, "disconnect" if name != "CLOSED" else "hangup", local=True))
 
@@ -484,11 +772,10 @@ class TgCallEngine:
         call = self.calls.get(int(user_id))
         if call is None or call.on_audio is None:
             return
-        for f in frames:
-            data = f.data
-            if data:
-                call.frames_in += 1
-                call.on_audio(bytes(data))
+        pcm = merge_frames(frames)
+        if pcm:
+            call.frames_in += 1
+            call.on_audio(pcm)
 
     def _on_signaling(self, user_id: int, data: bytes) -> None:
         self.loop.call_soon_threadsafe(self._queue_signaling, int(user_id), bytes(data))
@@ -498,26 +785,84 @@ class TgCallEngine:
         if call is not None and call.active:
             call._sig_out.put_nowait(data)
 
+    def _on_emojis(self, key: int, emojis: str) -> None:
+        self.loop.call_soon_threadsafe(self._emojis_changed, int(key), str(emojis))
+
+    def _emojis_changed(self, key: int, emojis: str) -> None:
+        call = self.calls.get(key)
+        if call is not None and call.active:
+            call.emojis = emojis
+            call._updated()
+
+    def _on_outbound_block(self, key: int, block: bytes) -> None:
+        self.loop.call_soon_threadsafe(self._spawn, self._broadcast_block(int(key), bytes(block)))
+
+    def _on_subchain_request(self, key: int, request) -> None:
+        self.loop.call_soon_threadsafe(self._spawn, self._fetch_subchain(
+            int(key), int(request.subchain), int(request.height), int(request.limit)))
+
+    def _on_request_participants(self, key: int, request=None) -> None:
+        self.loop.call_soon_threadsafe(self._refresh_participants_of, int(key))
+
+    def _refresh_participants_of(self, key: int) -> None:
+        conf = self.conferences.get(key)
+        if conf is not None:
+            self.loop.create_task(self._refresh_participants(conf))
+
+    def _spawn(self, coro) -> None:
+        self.loop.create_task(coro)
+
     # ---- MTProto updates ----
 
     async def _on_raw_update(self, update) -> None:
         if isinstance(update, types.UpdatePhoneCallSignalingData):
             call = self._by_call_id(update.phone_call_id)
-            if call is None:
+            if call is None or call.conference is not None:
                 return
             if call.state in (TgCallState.CONNECTING, TgCallState.CONNECTED) and call._sig_task is not None:
                 try:
-                    await self.ntg.send_signaling(call.user_id, update.data)
+                    await self.ntg.send_signaling_data(call.user_id, update.data)
                 except Exception as e:
-                    log.debug("send_signaling failed: %s", e)
+                    log.debug("send_signaling_data failed: %s", e)
             else:
                 call._sig_in.append(bytes(update.data))
             return
+        if isinstance(update, types.UpdateGroupCallChainBlocks):
+            conf = self._conference_by_call(update.call)
+            if conf is not None:
+                await self._apply_blocks(conf, update, from_short_poll=False)
+            return
+        if isinstance(update, types.UpdateGroupCallParticipants):
+            conf = self._conference_by_call(update.call)
+            if conf is None:
+                return
+            for p in update.participants:
+                uid = utils.get_peer_id(p.peer)
+                if p.left:
+                    conf.sources.pop(uid, None)
+                else:
+                    conf.sources[uid] = p.source
+            await self._participants_changed(conf)
+            return
         if isinstance(update, types.UpdateGroupCall):
             call_id = getattr(update.call, "id", None)
-            group = next((g for g in self.groups.values() if g.call.id == call_id), None)
+            group = next((g for g in self.groups.values() if g.call is not None and g.call.id == call_id), None)
             if group is not None and isinstance(update.call, types.GroupCallDiscarded):
                 await self.leave_group(group, "hangup")
+            conf = self._conference_by_call(update.call)
+            call = self.calls.get(conf.key) if conf is not None else None
+            if call is not None and call.conference is conf and isinstance(update.call, types.GroupCallDiscarded):
+                await self._end_call(call, "hangup", local=False)
+            return
+        if isinstance(update, (types.UpdateNewMessage, types.UpdateEditMessage)):
+            msg = update.message
+            if isinstance(msg, types.MessageService) and isinstance(msg.action, types.MessageActionConferenceCall):
+                if isinstance(update, types.UpdateNewMessage):
+                    await self._conference_invite(msg)
+                elif msg.action.missed:
+                    call = next((c for c in self.calls.values() if c.invite_msg_id == msg.id), None)
+                    if call is not None and call.state == TgCallState.INCOMING:
+                        await self._end_call(call, "missed", local=False)
             return
         if not isinstance(update, types.UpdatePhoneCall):
             return
@@ -538,7 +883,11 @@ class TgCallEngine:
                 call._confirmed.set_result(pc)
         elif isinstance(pc, types.PhoneCallDiscarded):
             call = self._by_call_id(pc.id)
-            if call is None:
+            if call is None or call._migrating or call.conference is not None:
+                return
+            if isinstance(pc.reason, types.PhoneCallDiscardReasonMigrateConferenceCall) and call.state == TgCallState.CONNECTED:
+                call._migrating = True              # the private media may report CLOSED before the task runs
+                self.loop.create_task(self._migrate(call, pc.reason.slug))
                 return
             reason = type(pc.reason).__name__.replace("PhoneCallDiscardReason", "").lower() if pc.reason else "hangup"
             log.info("tg call with %s discarded by peer: %s", call.user_id, reason)
@@ -569,6 +918,9 @@ class TgCallEngine:
             await self.account.invoke(functions.phone.ReceivedCallRequest(peer=call.peer))
         except RPCError as e:
             log.debug("receivedCall failed: %s", e)
+        await self._offer_incoming(call)
+
+    async def _offer_incoming(self, call: TgCall) -> None:
         if self.on_incoming:
             r = self.on_incoming(call)
             if asyncio.iscoroutine(r):

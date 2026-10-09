@@ -1,5 +1,5 @@
 aiohttp>=3.9
-ntgcalls>=2.2.5,<3
+ntgcalls>=3.0.2,<4
 telethon>=1.40
 numpy>=1.26
 PyYAML>=6.0

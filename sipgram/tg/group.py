@@ -1,12 +1,14 @@
-"""Telegram group calls (voice chats).
+"""Telegram group calls: the voice chat of a group, or a conference call that needs no group.
 
-`/conf` builds a conference on the PBX, which is the right place for internal numbers. A voice chat
-is the other direction: it lets people who have no extension, and are only reachable in Telegram,
-join the same conversation. The gateway joins the voice chat of one configured group and mixes the
-SIP legs into it.
+`/conf` builds a conference on the PBX, which is the right place for internal numbers. A Telegram
+group call is the other direction: it lets people who have no extension, and are only reachable in
+Telegram, join the same conversation. The gateway joins the voice chat of the configured group, or
+starts an E2E conference call when no group is configured, and mixes the SIP legs into it.
 
-Flow: create_call(chat_id) -> payload, set_stream_sources, phone.joinGroupCall(params=payload),
-UpdateGroupCallConnection.params -> connect(chat_id, params, False).
+Voice chat:  create_call(chat_id) -> payload, set_stream_sources, phone.joinGroupCall(params=payload),
+             UpdateGroupCallConnection.params -> connect(chat_id, params, False).
+Conference:  create_p2p_call(key) -> init_conference -> phone.createConferenceCall(join, public_key,
+             block, params) -> connect(key, params, False); see calls.py for the E2E chain.
 """
 from __future__ import annotations
 
@@ -16,10 +18,11 @@ import random
 import time
 from collections.abc import Callable
 
-import ntgcalls
 from telethon import utils
 from telethon.errors import RPCError
 from telethon.tl import functions, types
+
+from .media import FrameSender
 
 log = logging.getLogger("sipgram.tg.group")
 
@@ -58,14 +61,16 @@ async def _existing_call(account, entity) -> types.InputGroupCall | None:
 
 
 class TgGroupCall:
-    """One voice chat the gateway takes part in. Audio is exchanged as 10 ms PCM16 at 48 kHz."""
+    """One group call the gateway takes part in. Audio is exchanged as 10 ms PCM16 at 48 kHz."""
 
-    def __init__(self, engine, key: int, call: types.InputGroupCall, peer, title: str):
+    def __init__(self, engine, key: int, call: types.InputGroupCall | None, peer, title: str, conference: bool = False):
         self.engine = engine
         self.key = key
         self.call = call
         self.peer = peer
         self.title = title
+        self.conference = conference
+        self.sender = FrameSender(engine.ntg, key)
         self.sample_rate = GROUP_RATE
         self.joined = False
         self.created = time.time()
@@ -86,22 +91,21 @@ class TgGroupCall:
     def send_audio(self, pcm10ms: bytes) -> None:
         if not self.joined or not self.active:
             return
-        try:
-            fut = self.engine.ntg.send_external_frame(
-                self.key, ntgcalls.StreamDevice.MICROPHONE, pcm10ms, ntgcalls.FrameData(0, 0, 0, 0))
-            fut.add_done_callback(lambda f: f.cancelled() or f.exception())
-            self.frames_out += 1
-        except Exception as e:
-            log.debug("group send_external_frame failed: %s", e)
+        self.sender.push(pcm10ms)
+        self.frames_out += 1
 
     async def invite(self, users: list[types.InputUser]) -> list[str]:
-        """Rings the voice chat on those users' phones. Returns the ones Telegram refused."""
+        """Rings the group call on those users' phones. Returns the ones Telegram refused."""
         failed: list[str] = []
         for user in users:
+            if self.conference:
+                request = functions.phone.InviteConferenceCallParticipantRequest(call=self.call, user_id=user, video=False)
+            else:
+                request = functions.phone.InviteToGroupCallRequest(call=self.call, users=[user])
             try:
-                await self.engine.account.invoke(functions.phone.InviteToGroupCallRequest(call=self.call, users=[user]))
+                await self.engine.account.invoke(request)
             except RPCError as e:
-                log.info("cannot invite %s into the voice chat: %s", user.user_id, e)
+                log.info("cannot invite %s into the group call: %s", user.user_id, e)
                 failed.append(str(user.user_id))
         return failed
 

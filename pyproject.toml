@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sipgram"
-version = "0.5.0"
+version = "0.6.0"
 description = "Self-hosted SIP <-> Telegram voice gateway (softphone inside Telegram for your own PBX)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,7 +13,7 @@ license-files = ["LICENSE", "NOTICE.md"]
 authors = [{name = "vasmarfas"}]
 dependencies = [
     "aiohttp>=3.9",
-    "ntgcalls>=2.2.5,<3",
+    "ntgcalls>=3.0.2,<4",
     "telethon>=1.40",
     "numpy>=1.26",
     "PyYAML>=6.0",

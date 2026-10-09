@@ -68,13 +68,14 @@ STRINGS: dict[str, dict[str, str]] = {
             "и соединю. Или позвоните мне: наберу номер по умолчанию либо последний присланный.\n"
             "\n"
             "**В разговоре:** цифры, `*` и `#` уходят как DTMF (и звучат в трубке). "
-            "Ещё один номер — второй вызов, текущий уйдёт на удержание.\n"
+            "Ещё один номер — второй вызов, текущий уйдёт на удержание. "
+            "Добавить людей можно прямо в Telegram: звонок станет групповым, абонент АТС останется в нём.\n"
             "\n"
             "**Команды**\n"
             "`/hangup` — завершить текущий вызов\n"
             "`/switch` — переключиться между вызовами\n"
             "`/transfer` — соединить два вызова, `/transfer 101` — перевести на номер\n"
-            "`/conf` — конференция на АТС, `/group` — голосовой чат Telegram\n"
+            "`/conf` — конференция на АТС, `/group` — групповой звонок в Telegram\n"
             "`/cb` — перезвонить последнему звонившему\n"
             "`/redial` — повторить последний набор\n"
             "`/dnd` — не беспокоить\n"
@@ -99,17 +100,20 @@ STRINGS: dict[str, dict[str, str]] = {
         "conf_started": "👥 Собираю конференцию в комнате `{room}`",
         "conf_joined": "👥 {peer} переведён в конференцию",
         "conf_failed": "❌ Не удалось собрать конференцию: {reason}",
-        "group_no_chat": "Групповой звонок не настроен: задайте `calls.group_chat` — группу, в голосовом чате которой собираемся",
         "group_joining": "👥 Подключаюсь к голосовому чату {chat}…",
+        "conf_tg_starting": "👥 Создаю групповой звонок в Telegram…",
         "group_failed": "❌ Групповой звонок не удался: {reason}",
         "group_moved": "👥 В голосовом чате «{chat}»: {peers}",
+        "group_moved_conference": "👥 В групповом звонке Telegram: {peers}",
         "group_invited": "📨 Приглашение в голосовой чат «{chat}» отправлено: {who}\nПримите звонок Telegram или войдите в чат группы.",
+        "group_invited_conference": "📨 Позвал в групповой звонок Telegram: {who}\nПримите звонок в Telegram.",
         "group_invite_failed": "❌ Не удалось пригласить {who}: {reason}",
         "group_dial_failed": "❌ `{number}` в групповой звонок не завести: {reason}",
-        "group_left_by": "👥 {peer} вышел из голосового чата",
+        "group_left_by": "👥 {peer} отключился от группового звонка",
         "group_ended": "👥 Групповой звонок завершён",
         "group_none": "Групповой звонок не запущен",
         "status_group": "👥 Голосовой чат «{chat}»: линий {n}",
+        "status_group_conference": "👥 Групповой звонок Telegram: линий {n}",
         "cmd_group": "групповой звонок в Telegram",
         "filtered": "🔕 Звонок от {caller} не пропущен: {reason}",
         "filtered_forwarded": "↪️ Звонок от {caller} переведён на `{number}`: {reason}",
@@ -171,6 +175,34 @@ STRINGS: dict[str, dict[str, str]] = {
         "card_ringing": "📞 Входящий: {caller}",
         "card_held": "⏸ На удержании: {peer}",
         "card_waiting": "📞 Ожидает: {caller}",
+        "card_conference": "👥 Групповой звонок Telegram, участников: {n}",
+        "card_key": "🔐 Ключ: {emojis}",
+        "tg_conference": "👥 Звонок стал групповым. Абонент АТС остаётся в нём и слышит всех, команды работают как прежде.",
+        "tg_conference_failed": "❌ Не удалось перейти в групповой звонок, абонент АТС отключён",
+        "taken_by": "📞 Вызов от {caller} принял {name}",
+        "callback_failed": "❌ Не смог позвонить вам в Telegram: {reason}",
+        "missed_reason": "Не дозвонился: {reason}",
+        "tg_privacy": "звонки от аккаунта шлюза запрещены в настройках конфиденциальности "
+                      "(Настройки → Конфиденциальность → Звонки → Исключения)",
+        "tg_blocked": "аккаунт шлюза у вас в чёрном списке",
+        "tg_no_media": "звонок не соединился, серверы звонков Telegram недоступны",
+        "tg_flood": "Telegram временно ограничил звонки с аккаунта шлюза",
+        "action_unavailable": "«нет ответа» (480)",
+        "action_busy": "«занято» (486)",
+        "action_reject": "«отказ» (603)",
+        "sip_403": "станция запретила вызов",
+        "sip_404": "номер не найден",
+        "sip_408": "нет ответа",
+        "sip_410": "номер больше не обслуживается",
+        "sip_480": "абонент недоступен",
+        "sip_484": "номер набран не полностью",
+        "sip_486": "занято",
+        "sip_487": "вызов отменён",
+        "sip_488": "нет общего кодека",
+        "sip_503": "линия недоступна",
+        "sip_600": "занято",
+        "sip_603": "абонент отклонил вызов",
+        "sip_604": "номер не существует",
     },
     "en": {
         "incoming": "📞 **Incoming:** {caller}\nLine {account}",
@@ -228,13 +260,14 @@ STRINGS: dict[str, dict[str, str]] = {
             "Or call me: I dial the default destination or the last number you sent.\n"
             "\n"
             "**During a call:** digits, `*` and `#` are sent as DTMF (and you hear them). "
-            "Another number starts a second call and holds the current one.\n"
+            "Another number starts a second call and holds the current one. "
+            "You can add people right in Telegram: the call becomes a group call and the PBX party stays in it.\n"
             "\n"
             "**Commands**\n"
             "`/hangup` ends the current call\n"
             "`/switch` toggles between calls\n"
             "`/transfer` connects the two calls, `/transfer 101` transfers to a number\n"
-            "`/conf` starts a conference on the PBX, `/group` a Telegram voice chat\n"
+            "`/conf` starts a conference on the PBX, `/group` a Telegram group call\n"
             "`/cb` calls back the last caller\n"
             "`/redial` repeats the last number\n"
             "`/dnd` toggles do not disturb\n"
@@ -259,17 +292,20 @@ STRINGS: dict[str, dict[str, str]] = {
         "conf_started": "👥 Building a conference in room `{room}`",
         "conf_joined": "👥 {peer} moved into the conference",
         "conf_failed": "❌ Could not build the conference: {reason}",
-        "group_no_chat": "Group calls are not configured: set `calls.group_chat` to the group whose voice chat is used",
         "group_joining": "👥 Joining the voice chat of {chat}…",
+        "conf_tg_starting": "👥 Starting a Telegram group call…",
         "group_failed": "❌ The group call failed: {reason}",
         "group_moved": "👥 In the voice chat \"{chat}\": {peers}",
+        "group_moved_conference": "👥 In the Telegram group call: {peers}",
         "group_invited": "📨 Invitation to the voice chat \"{chat}\" sent to: {who}\nAccept the Telegram call or open the group.",
+        "group_invited_conference": "📨 Invited to the Telegram group call: {who}\nAccept the call in Telegram.",
         "group_invite_failed": "❌ Could not invite {who}: {reason}",
         "group_dial_failed": "❌ Could not bring `{number}` into the group call: {reason}",
-        "group_left_by": "👥 {peer} left the voice chat",
+        "group_left_by": "👥 {peer} left the group call",
         "group_ended": "👥 The group call is over",
         "group_none": "No group call is running",
         "status_group": "👥 Voice chat \"{chat}\": {n} line(s)",
+        "status_group_conference": "👥 Telegram group call: {n} line(s)",
         "cmd_group": "Telegram group call",
         "filtered": "🔕 The call from {caller} was not put through: {reason}",
         "filtered_forwarded": "↪️ The call from {caller} was forwarded to `{number}`: {reason}",
@@ -331,6 +367,34 @@ STRINGS: dict[str, dict[str, str]] = {
         "card_ringing": "📞 Incoming: {caller}",
         "card_held": "⏸ On hold: {peer}",
         "card_waiting": "📞 Waiting: {caller}",
+        "card_conference": "👥 Telegram group call, {n} participant(s)",
+        "card_key": "🔐 Key: {emojis}",
+        "tg_conference": "👥 The call became a group call. The PBX party stays in it and hears everyone; commands work as before.",
+        "tg_conference_failed": "❌ Could not move into the group call, the PBX party was disconnected",
+        "taken_by": "📞 {name} took the call from {caller}",
+        "callback_failed": "❌ Could not call you in Telegram: {reason}",
+        "missed_reason": "Could not reach you: {reason}",
+        "tg_privacy": "your privacy settings do not allow calls from the gateway account "
+                      "(Settings → Privacy → Calls → Exceptions)",
+        "tg_blocked": "you have blocked the gateway account",
+        "tg_no_media": "the call did not connect, Telegram call servers are unreachable",
+        "tg_flood": "Telegram temporarily limited calls from the gateway account",
+        "action_unavailable": "\"no answer\" (480)",
+        "action_busy": "\"busy\" (486)",
+        "action_reject": "\"declined\" (603)",
+        "sip_403": "the PBX refused the call",
+        "sip_404": "number not found",
+        "sip_408": "no answer",
+        "sip_410": "the number is no longer in service",
+        "sip_480": "unavailable",
+        "sip_484": "incomplete number",
+        "sip_486": "busy",
+        "sip_487": "call cancelled",
+        "sip_488": "no codec in common",
+        "sip_503": "line unavailable",
+        "sip_600": "busy",
+        "sip_603": "declined",
+        "sip_604": "the number does not exist",
     },
 }
 
