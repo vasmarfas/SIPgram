@@ -3,7 +3,7 @@
 [![ci](https://github.com/vasmarfas/sipgram/actions/workflows/ci.yml/badge.svg)](https://github.com/vasmarfas/sipgram/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-PolyForm%20Noncommercial-blue)](LICENSE)
 
-**[Русская версия](README.ru.md)**
+**[Русская версия](README.ru.md)** · **[Telegram chat](https://t.me/vasmarfas_chat)**
 
 A self-hosted SIP to Telegram voice gateway. SIPgram registers on your FreePBX/Asterisk as ordinary extensions and
 turns calls into **regular Telegram calls**: peer to peer voice calls, not group chats and not voice messages.

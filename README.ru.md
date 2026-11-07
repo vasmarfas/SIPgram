@@ -3,7 +3,7 @@
 [![ci](https://github.com/vasmarfas/sipgram/actions/workflows/ci.yml/badge.svg)](https://github.com/vasmarfas/sipgram/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-PolyForm%20Noncommercial-blue)](LICENSE)
 
-**[English version](README.md)**
+**[English version](README.md)** · **[Чат в Telegram](https://t.me/vasmarfas_chat)**
 
 Самостоятельно размещаемый шлюз между SIP и Telegram. SIPgram регистрируется на вашей FreePBX/Asterisk обычными
 внутренними номерами и превращает звонки в **обычные звонки Telegram**: голосовые P2P-вызовы, не групповые чаты и
